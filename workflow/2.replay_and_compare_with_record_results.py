@@ -2,8 +2,8 @@
 G1 左臂【关节回放 + 拍照对比】—— 上位机版（相机走 ZMQ；独立脚本）。
 
 配套 `1.g1_left_arm_teach_capture_remote.py`：方法一用拖动示教采了一批
-<时间戳>.json(含左臂关节角) + <时间戳>.png。本脚本把这些关节角【慢速、安全地】
-回放到机器人左臂，每到一个姿态拍一张图，存回同一文件夹：
+<时间戳>.png(图片) + txt/<时间戳>.txt(含左臂关节角)。本脚本把这些关节角【慢速、
+安全地】回放到机器人左臂，每到一个姿态拍一张图，存回同一文件夹：
     <时间戳>_replay.png   回放时拍的实际画面
     <时间戳>_diff.png     原图 | 回放图 | 差异热力图  三联对比
 
@@ -60,10 +60,10 @@ _spec = _ilu.spec_from_file_location("g1_capture_remote", _CAP_PATH)
 _cap = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_cap)
 
-# 复用方法一的常量与相机类（“能继承就不修改原代码”）
+# 复用方法一的常量/相机类/手臂配置（“能继承就不修改原代码”）
 ZmqCamera = _cap.ZmqCamera
-LEFT_ARM_JOINTS = _cap.LEFT_ARM_JOINTS    # name -> sdk idx (顺序同 json 里的 left_arm_names)
-HELD_SDK_IDX = _cap.HELD_SDK_IDX          # 腰 + 右臂：死锁
+arm_joints = _cap.arm_joints              # side('left'/'right') -> {关节名: sdk idx}
+held_sdk_idx = _cap.held_sdk_idx          # side -> 死锁(腰 + 另一条臂) 的 sdk idx
 ALL_SDK = _cap.ALL_SDK                    # 全身可控关节 name -> sdk idx (建 FK 用)
 WEIGHT_IDX = _cap.WEIGHT_IDX
 CONTROL_DT = _cap.CONTROL_DT              # 100 Hz
@@ -81,6 +81,10 @@ TAU_CLAMP = 25.0         # Nm, 重力补偿前馈力矩限幅（安全）
 class ReplayCompare:
     def __init__(self, args):
         self.args = args
+        # 被回放臂(left/right): 默认按 --arm; 没指定则在 _list_records 里从数据自动识别
+        self.arm = getattr(args, "arm", None) or "left"
+        self.arm_joints = arm_joints(self.arm)
+        self.held_idx = held_sdk_idx(self.arm)
         self.crc = CRC()
         self.low_cmd = unitree_hg_msg_dds__LowCmd_()
         self.low_state = None
@@ -88,10 +92,26 @@ class ReplayCompare:
         self.weight = 0.0
         self.releasing = False
         self.lock = threading.Lock()
-        # 左臂指令角(cmd_left) 与 目标角(target_left)，单位 rad，按 sdk idx 索引
-        self.cmd_left = {}
-        self.target_left = {}
+        # 被回放臂指令角(cmd_arm) 与 目标角(target_arm)，单位 rad，按 sdk idx 索引
+        self.cmd_arm = {}
+        self.target_arm = {}
         self.max_step = args.speed * CONTROL_DT     # 每控制周期允许的最大角度变化
+
+    def _set_arm(self, side):
+        """确定被回放臂并刷新关节/死锁配置 (回放必须在 init_targets 之前调用)。"""
+        self.arm = side
+        self.arm_joints = arm_joints(side)
+        self.held_idx = held_sdk_idx(side)
+
+    def _zero_waist(self):
+        """把腰部 3 关节(yaw/roll/pitch = rpy)的死锁保持目标设为 0,0,0。
+        腰部本就在死锁集里(大刚度保持), 这里只是把目标从当前角改成 0;
+        接管时 arm_sdk weight 0->1 渐入, 腰会缓慢回正, 不会突然急动。
+        需在 init_targets 之后(self.held 已建立)调用。"""
+        for sdk in _cap.WAIST_SDK_IDX:
+            if sdk in self.held:
+                self.held[sdk] = 0.0
+        print("腰部保持目标已设为 rpy=0,0,0 (接管后随 weight 渐入缓慢回正)。")
 
     # ---- DDS（同方法一）------------------------------------------------------
     def init_dds(self):
@@ -109,16 +129,16 @@ class ReplayCompare:
 
     def init_targets(self):
         """初始化锁定关节角 + 左臂指令/目标角(都=当前实测，先原地保持)。"""
-        self.held = {sdk: self.low_state.motor_state[sdk].q for sdk in HELD_SDK_IDX}
-        for sdk in LEFT_ARM_JOINTS.values():
+        self.held = {sdk: self.low_state.motor_state[sdk].q for sdk in self.held_idx}
+        for sdk in self.arm_joints.values():
             q = self.low_state.motor_state[sdk].q
-            self.cmd_left[sdk] = q
-            self.target_left[sdk] = q
+            self.cmd_arm[sdk] = q
+            self.target_arm[sdk] = q
 
     # ---- 运动学 / 重力补偿（同方法一建模, 用于前馈抵消重力下垂）-----------------
     def init_kinematics(self):
         if not self.args.gravcomp:
-            self.left_iv = None
+            self.arm_iv = None
             return
         try:
             self.model = pin.buildModelFromUrdf(self.args.urdf)  # 固定基座 @ pelvis
@@ -126,12 +146,12 @@ class ReplayCompare:
             # name -> idx_q (建全身配置), 左臂 name -> idx_v (取重力力矩)
             self.qmap = [(self.model.joints[self.model.getJointId(n)].idx_q, sdk)
                          for n, sdk in ALL_SDK.items() if n in self.model.names]
-            self.left_iv = [(self.model.joints[self.model.getJointId(n)].idx_v, sdk)
-                            for n, sdk in LEFT_ARM_JOINTS.items() if n in self.model.names]
+            self.arm_iv = [(self.model.joints[self.model.getJointId(n)].idx_v, sdk)
+                            for n, sdk in self.arm_joints.items() if n in self.model.names]
             print(f"[gravcomp] 已加载 URDF 做重力补偿: {self.args.urdf}")
         except Exception as e:
             print(f"[gravcomp] 加载 URDF 失败, 关闭重力补偿: {e}")
-            self.left_iv = None
+            self.arm_iv = None
 
     def _full_q(self):
         q = pin.neutral(self.model)
@@ -141,12 +161,12 @@ class ReplayCompare:
 
     def _gravity_tau(self):
         """返回 {sdk: tau_ff}，抵消当前姿态下左臂各关节的重力力矩。"""
-        if self.left_iv is None:
+        if self.arm_iv is None:
             return {}
         g = pin.computeGeneralizedGravity(self.model, self.fk_data, self._full_q())
         scale = self.args.gravity_scale
         return {sdk: float(np.clip(g[idx_v] * scale, -TAU_CLAMP, TAU_CLAMP))
-                for idx_v, sdk in self.left_iv}
+                for idx_v, sdk in self.arm_iv}
 
     # ---- 控制环 (100 Hz) -----------------------------------------------------
     def control_step(self):
@@ -164,15 +184,15 @@ class ReplayCompare:
 
         # 左臂：限速插值逼近目标角，刚性位置控制 + 重力补偿
         with self.lock:
-            for sdk in LEFT_ARM_JOINTS.values():
-                cur = self.cmd_left[sdk]
-                tgt = self.target_left[sdk]
+            for sdk in self.arm_joints.values():
+                cur = self.cmd_arm[sdk]
+                tgt = self.target_arm[sdk]
                 d = tgt - cur
                 if abs(d) > self.max_step:
                     cur += self.max_step if d > 0 else -self.max_step
                 else:
                     cur = tgt
-                self.cmd_left[sdk] = cur
+                self.cmd_arm[sdk] = cur
                 m = self.low_cmd.motor_cmd[sdk]
                 m.q, m.dq, m.tau = float(cur), 0.0, gtau.get(sdk, 0.0)
                 m.kp, m.kd = KP_HOLD, KD_HOLD
@@ -188,21 +208,21 @@ class ReplayCompare:
     def _set_target(self, names, q):
         with self.lock:
             for n, val in zip(names, q):
-                if n in LEFT_ARM_JOINTS:
-                    self.target_left[LEFT_ARM_JOINTS[n]] = float(val)
+                if n in self.arm_joints:
+                    self.target_arm[self.arm_joints[n]] = float(val)
 
     def _reached(self):
         with self.lock:
-            return all(abs(self.target_left[s] - self.cmd_left[s]) <= REACH_TOL
-                       for s in LEFT_ARM_JOINTS.values())
+            return all(abs(self.target_arm[s] - self.cmd_arm[s]) <= REACH_TOL
+                       for s in self.arm_joints.values())
 
     def _max_move_dist(self, names, q):
         """目标相对当前指令角的最大单关节移动量(rad)，用于估算到位时间。"""
         with self.lock:
             d = 0.0
             for n, val in zip(names, q):
-                if n in LEFT_ARM_JOINTS:
-                    d = max(d, abs(float(val) - self.cmd_left[LEFT_ARM_JOINTS[n]]))
+                if n in self.arm_joints:
+                    d = max(d, abs(float(val) - self.cmd_arm[self.arm_joints[n]]))
             return d
 
     def wait_until_reached(self, est_time):
@@ -218,8 +238,8 @@ class ReplayCompare:
         """实测左臂关节角与目标角的最大单关节误差(度)，验证是否真正到位。"""
         e = 0.0
         for n, val in zip(names, q):
-            if n in LEFT_ARM_JOINTS:
-                m = self.low_state.motor_state[LEFT_ARM_JOINTS[n]].q
+            if n in self.arm_joints:
+                m = self.low_state.motor_state[self.arm_joints[n]].q
                 e = max(e, abs(m - float(val)))
         return float(np.degrees(e))
 
@@ -236,15 +256,15 @@ class ReplayCompare:
     # ---- debug 显示 ----------------------------------------------------------
     @staticmethod
     def _short(name):
-        return name.replace("left_", "").replace("_joint", "")
+        return _cap._short_joint(name)
 
     def _measured_q_list(self, names):
-        return [self.low_state.motor_state[LEFT_ARM_JOINTS[n]].q
-                for n in names if n in LEFT_ARM_JOINTS]
+        return [self.low_state.motor_state[self.arm_joints[n]].q
+                for n in names if n in self.arm_joints]
 
     def _fmt_q_deg(self, names, q):
         return "  ".join(f"{self._short(n)}={np.degrees(v):+6.1f}"
-                         for n, v in zip(names, q) if n in LEFT_ARM_JOINTS)
+                         for n, v in zip(names, q) if n in self.arm_joints)
 
     def debug_drive(self, names, q, orig_img):
         """debug 模式: 边等到位边显示【实时画面/采集原图】两窗口, 滚动打印当前关节角。
@@ -289,9 +309,9 @@ class ReplayCompare:
         if self.low_state is None:
             return
         with self.lock:
-            for sdk in LEFT_ARM_JOINTS.values():
-                self.target_left[sdk] = self.low_state.motor_state[sdk].q
-                self.cmd_left[sdk] = self.target_left[sdk]
+            for sdk in self.arm_joints.values():
+                self.target_arm[sdk] = self.low_state.motor_state[sdk].q
+                self.cmd_arm[sdk] = self.target_arm[sdk]
         self.releasing = True
         print("\n交还上半身给站立控制器 (weight -> 0) ...")
         time.sleep(T_ENGAGE + 0.5)
@@ -323,36 +343,40 @@ class ReplayCompare:
 
     # ---- 主流程 --------------------------------------------------------------
     def _list_records(self):
-        """收集数据目录下的原始记录 json（排除 intrinsics / 已生成的 replay/diff）。"""
+        """收集数据目录 txt/ 下的采样记录（png 在根目录, 与 txt 同名时间戳）。
+        顺便从 txt 的 arm 字段识别本批数据用的是哪条臂, 存到 self._data_arm。"""
         recs = []
-        for jp in sorted(glob.glob(os.path.join(self.args.data, "*.json"))):
-            name = os.path.basename(jp)
-            if name == "intrinsics.json":
-                continue
+        arms = set()
+        txt_dir = os.path.join(self.args.data, "txt")
+        for tp in sorted(glob.glob(os.path.join(txt_dir, "*.txt"))):
+            stamp = os.path.splitext(os.path.basename(tp))[0]
             try:
-                with open(jp) as f:
-                    rec = json.load(f)
+                r = _cap.parse_capture_txt(tp)
             except Exception as e:
-                print(f"[skip] 读取失败 {name}: {e}")
+                print(f"[skip] 读取失败 {os.path.basename(tp)}: {e}")
                 continue
-            js = rec.get("joint_states", {})
-            if "left_arm_q" not in js or "left_arm_names" not in js:
+            if not r["joint_names"] or not r["joint_q"]:
                 continue
-            stamp = rec.get("timestamp", os.path.splitext(name)[0])
-            img = rec.get("image", stamp + ".png")
-            recs.append((stamp, img, js["left_arm_names"], js["left_arm_q"]))
+            arms.add(r.get("arm", "left"))
+            recs.append((stamp, stamp + ".png", r["joint_names"], r["joint_q"]))
+        if len(arms) > 1:
+            print(f"WARNING: 数据里混了多条臂 {arms}, 将以 {sorted(arms)[0]} 为准(可用 --arm 覆盖)。")
+        self._data_arm = (sorted(arms)[0] if arms else "left")
         return recs
 
     def run(self):
         self.init_dds()
-        self.init_targets()
-        self.init_kinematics()
 
         records = self._list_records()
         if not records:
-            print(f"ERROR: 在 {self.args.data} 没找到可回放的记录 json。")
+            print(f"ERROR: 在 {self.args.data}/txt 没找到可回放的记录 txt。")
             return
-        print(f"找到 {len(records)} 条记录待回放。")
+        # 优先用命令行 --arm, 否则用数据里识别出的臂
+        self._set_arm(self.args.arm or self._data_arm)
+        print(f"找到 {len(records)} 条记录待回放。(臂: {self.arm})")
+
+        self.init_targets()
+        self.init_kinematics()
 
         # 相机流先探活，收不到图就退出，不接管手臂
         self.rs = ZmqCamera(self.args.host, self.args.port, self.args.intrinsics)
@@ -364,9 +388,13 @@ class ReplayCompare:
             return
         print("相机流正常。")
 
+        # 图片传输检测通过后: 把腰部 rpy 设为 0,0,0 (接管后随 weight 渐入回正)
+        self._zero_waist()
+
+        arm_cn = "左臂" if self.arm == "left" else "右臂"
         try:
             input(f"\n相机已连通。将以 {self.args.speed} rad/s 慢速回放 {len(records)} 个姿态。\n"
-                  "请清空左臂工作区、备好随时急停(Ctrl-C / x)，按 Enter 开始接管左臂...")
+                  f"请清空{arm_cn}工作区、备好随时急停(Ctrl-C / x)，按 Enter 开始接管{arm_cn}...")
         except KeyboardInterrupt:
             self.rs.stop()
             print("\n已取消，未接管手臂。")
@@ -374,7 +402,7 @@ class ReplayCompare:
 
         self.ctrl = RecurrentThread(interval=CONTROL_DT, target=self.control_step, name="arm_replay")
         self.ctrl.Start()
-        print(f"Engaging arm_sdk (weight 0->1, {T_ENGAGE}s) ... 左臂将开始慢速移动。\n")
+        print(f"Engaging arm_sdk (weight 0->1, {T_ENGAGE}s) ... {self.arm} 臂将开始慢速移动。\n")
         time.sleep(T_ENGAGE + 0.3)   # 等 weight 接管到位再开始动
 
         if self.args.debug:
@@ -442,8 +470,10 @@ if __name__ == "__main__":
         "..", "g1_description", "g1_29dof_with_hand_rev_1_0.urdf"))
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("data", help="采集数据目录(含 <时间戳>.json/.png)，如 ./calib_data_20260615_0416")
+    ap.add_argument("data", help="采集数据目录(含 <时间戳>.png + txt/<时间戳>.txt)，如 ./calib_data_20260615_0416")
     ap.add_argument("--net", default="enp12s0", help="上位机连机器人的网卡, 如 enp12s0")
+    ap.add_argument("--arm", choices=["left", "right"], default=None,
+                    help="回放哪条臂; 默认按数据 txt 里的 arm 字段自动识别")
     ap.add_argument("--speed", type=float, default=DEFAULT_SPEED,
                     help=f"左臂每关节最大角速度 rad/s (越小越慢越安全, 默认 {DEFAULT_SPEED})")
     ap.add_argument("--settle", type=float, default=DEFAULT_SETTLE,
@@ -466,8 +496,9 @@ if __name__ == "__main__":
     ap.set_defaults(gravcomp=True)
     args = ap.parse_args()
 
-    print("WARNING: clear the workspace; keep a hand ready to support the LEFT arm.")
-    print(f"左臂将慢速回放 {os.path.abspath(args.data)} 里的关节姿态。")
+    _arm_hint = args.arm or "数据自动识别"
+    print(f"WARNING: clear the workspace; keep a hand ready to support the arm ({_arm_hint}).")
+    print(f"将慢速回放 {os.path.abspath(args.data)} 里的关节姿态 (臂: {_arm_hint})。")
     input("Robot must be standing (锁定站立), motion mode NOT released. Press Enter...")
     ChannelFactoryInitialize(0, args.net)
     ReplayCompare(args).run()

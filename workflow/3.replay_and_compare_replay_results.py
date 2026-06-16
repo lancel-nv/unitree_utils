@@ -11,7 +11,10 @@ G1 左臂【多次回放 + 重复性/精度统计 + 误差绘图】—— 上位
 输出目录结构（在采集数据目录下新建 replay/）
 --------------------------------------------
 <data>/replay/
-    <run时间戳_1>/  <stamp>_replay.png  (+ _diff.png, measured.json)
+    <run时间戳_1>/  <stamp>_replay.png  (+ _diff.png)
+                    <stamp>.txt             # 每姿态: 实测 + 目标 + 误差(measured/target/error)
+                    <stamp>_all_joint.json  # 每姿态: 实测全身 29 关节状态 + IMU(同 get_joint_states 格式)
+                    measured.json           # 左臂实测/目标/误差 json 汇总(保留, 不变)
     <run时间戳_2>/  ...
     <run时间戳_3>/  ...
     summary.json            # 全部统计汇总
@@ -21,8 +24,10 @@ G1 左臂【多次回放 + 重复性/精度统计 + 误差绘图】—— 上位
 
 用法
 ----
-python3 3.replay_and_compare_replay_results.py ./calib_data_20260615_0416
-python3 3.replay_and_compare_replay_results.py ./calib_data_20260615_0416 --runs 3 --speed 0.2
+terminal 1:
+- cd lancel/ && conda activate cam && python image_server.py 
+terminal 2:
+- cd /home/lancel/unitree_utils/workflow && conda activate g1 && python3 3.replay_and_compare_replay_results.py ./calib_data_20260615_0416 --runs 3 --speed 0.2
 """
 
 import argparse
@@ -31,6 +36,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -54,7 +60,7 @@ def _load_module(name, rel_path):
 _m2 = _load_module("replay_compare_m2", "2.replay_and_compare_with_record_results.py")
 ReplayCompare = _m2.ReplayCompare
 ZmqCamera = _m2.ZmqCamera
-LEFT_ARM_JOINTS = _m2.LEFT_ARM_JOINTS
+arm_joints = _m2.arm_joints              # side -> {关节名: sdk idx}
 CONTROL_DT = _m2.CONTROL_DT
 T_ENGAGE = _m2.T_ENGAGE
 
@@ -62,6 +68,11 @@ T_ENGAGE = _m2.T_ENGAGE
 _stab = _load_module("stability_chessboard",
                      os.path.join("..", "reference_code",
                                   "2a.compute_replay_stablebility_chessBoard.py"))
+# 复用 scripts/get_joint_states.py 的全身关节命名（all_joint.json 与其同格式）
+_gjs = _load_module("get_joint_states",
+                    os.path.join("..", "scripts", "get_joint_states.py"))
+G1_ALL_JOINT_NAMES = _gjs.G1_JOINT_NAMES
+
 EefPose = _stab.EefPose
 detect_corners = _stab.detect_corners
 corner_shift_stats = _stab.corner_shift_stats
@@ -75,7 +86,7 @@ DEFAULT_PATTERN_COLS = _stab.DEFAULT_PATTERN_COLS
 DEFAULT_PATTERN_ROWS = _stab.DEFAULT_PATTERN_ROWS
 DEFAULT_N_WORST = _stab.DEFAULT_N_WORST
 
-JOINT_NAMES = list(LEFT_ARM_JOINTS.keys())   # 规范关节顺序（绘图/统计对齐用）
+# 规范关节顺序(self.joint_names)在确定被回放臂后于 _load_records_full 里设置
 
 
 def _rot_angle_deg(Ra, Rb):
@@ -89,6 +100,9 @@ class ReplayMultiRun(ReplayCompare):
     """多次回放 + 统计。复用 ReplayCompare 的运动控制, 仅扩展 FK 末端 + 主流程。"""
 
     def init_kinematics(self):
+        # 末端坐标系没显式指定时, 按被回放臂取 <arm>_hand_palm_link
+        if not self.args.ee_frame:
+            self.args.ee_frame = f"{self.arm}_hand_palm_link"
         # 强制开启建模（FK 比较必需），复用父类建 model/qmap/重力补偿
         self.args.gravcomp = True
         super().init_kinematics()
@@ -102,6 +116,27 @@ class ReplayMultiRun(ReplayCompare):
         """当前实测姿态下的末端位姿 (pelvis 固定基座, 与采集时同一套 FK)。"""
         pin.framesForwardKinematics(self.model, self.fk_data, self._full_q())
         return self.fk_data.oMf[self.ee_id].copy()
+
+    def _save_all_joint_json(self, run_dir, stamp):
+        """把当前【实测】全身关节状态(29 关节 + IMU)存为 <stamp>_all_joint.json,
+        字段格式与 scripts/get_joint_states.py 一致(timestamp + imu_rpy + joints)。"""
+        s = self.low_state
+        if s is None:
+            return
+        rpy = s.imu_state.rpy
+        record = {
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "imu_rpy": {"roll": float(rpy[0]), "pitch": float(rpy[1]), "yaw": float(rpy[2])},
+            "joints": [
+                {"idx": i, "name": G1_ALL_JOINT_NAMES[i],
+                 "q": float(s.motor_state[i].q),
+                 "dq": float(s.motor_state[i].dq),
+                 "tau_est": float(s.motor_state[i].tau_est)}
+                for i in range(len(G1_ALL_JOINT_NAMES))
+            ],
+        }
+        with open(os.path.join(run_dir, stamp + "_all_joint.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
 
     def _capture_fresh(self, flush_s=0.6):
         """拿一张【新鲜】帧。
@@ -124,28 +159,34 @@ class ReplayMultiRun(ReplayCompare):
     def _load_records_full(self):
         recs = []
         import glob
-        for jp in sorted(glob.glob(os.path.join(self.args.data, "*.json"))):
-            name = os.path.basename(jp)
-            if name == "intrinsics.json":
-                continue
+        txt_dir = os.path.join(self.args.data, "txt")
+        parsed = []
+        arms = set()
+        for tp in sorted(glob.glob(os.path.join(txt_dir, "*.txt"))):
+            stamp = os.path.splitext(os.path.basename(tp))[0]
             try:
-                with open(jp) as f:
-                    rec = json.load(f)
+                r = _m2._cap.parse_capture_txt(tp)
             except Exception:
                 continue
-            js = rec.get("joint_states", {})
-            if "left_arm_q" not in js or "left_arm_names" not in js:
+            if not r["joint_names"] or not r["joint_q"]:
                 continue
-            stamp = rec.get("timestamp", os.path.splitext(name)[0])
-            img = rec.get("image", stamp + ".png")
+            arms.add(r.get("arm", "left"))
+            parsed.append((stamp, r))
+        if not parsed:
+            return recs
+        if len(arms) > 1:
+            print(f"WARNING: 数据里混了多条臂 {arms}, 将以 {sorted(arms)[0]} 为准(可用 --arm 覆盖)。")
+        # 确定被回放臂 + 规范关节顺序(self.joint_names)
+        self._set_arm(self.args.arm or sorted(arms)[0])
+        self.joint_names = list(self.arm_joints.keys())
+        for stamp, r in parsed:
             # 目标关节角对齐到规范顺序
-            qmap = dict(zip(js["left_arm_names"], js["left_arm_q"]))
-            q_tgt = [float(qmap.get(n, 0.0)) for n in JOINT_NAMES]
-            ee = rec.get("eef_pose", {})
-            R_tgt = np.array(ee.get("R_base_ee", [1, 0, 0, 0, 1, 0, 0, 0, 1]),
-                             float).reshape(3, 3)
-            t_tgt = np.array(ee.get("t_base_ee", [0, 0, 0]), float)
-            recs.append(dict(stamp=stamp, img=img, q_tgt=q_tgt,
+            qmap = dict(zip(r["joint_names"], r["joint_q"]))
+            q_tgt = [float(qmap.get(n, 0.0)) for n in self.joint_names]
+            # 目标姿态: 由四元数重建旋转矩阵(txt 不存 R), 平移直接取
+            R_tgt = _m2._cap.R_from_quat(r["quat_wxyz"])
+            t_tgt = np.array(r["tcp_xyz"], float)
+            recs.append(dict(stamp=stamp, img=stamp + ".png", q_tgt=q_tgt,
                              R_tgt=R_tgt, t_tgt=t_tgt))
         return recs
 
@@ -156,13 +197,14 @@ class ReplayMultiRun(ReplayCompare):
         results = []
         for i, r in enumerate(records):
             q_tgt = r["q_tgt"]
-            self._set_target(JOINT_NAMES, q_tgt)
-            dist = self._max_move_dist(JOINT_NAMES, q_tgt)
+            self._set_target(self.joint_names, q_tgt)
+            dist = self._max_move_dist(self.joint_names, q_tgt)
             est = dist / max(self.args.speed, 1e-6)
             self.wait_until_reached(est)
-            self.wait_settled(JOINT_NAMES, q_tgt)
+            self.wait_settled(self.joint_names, q_tgt)
+            time.sleep(1.0)   # 到位后静置 1s, 等机械臂/画面完全稳定再拍照采数据
 
-            q_meas = self._measured_q_list(JOINT_NAMES)
+            q_meas = self._measured_q_list(self.joint_names)
             T = self._measured_ee()
             t_meas = np.asarray(T.translation, float)
             R_meas = np.asarray(T.rotation, float)
@@ -184,6 +226,21 @@ class ReplayMultiRun(ReplayCompare):
                     if os.path.isfile(orig_path):
                         comp, _ = self.make_diff(cv2.imread(orig_path), frame)
                         cv2.imwrite(os.path.join(run_dir, r["stamp"] + "_diff.png"), comp)
+
+            # 额外存每姿态 txt(实测 + 目标 + 误差); measured.json 仍照常保存(不变)
+            txt = _m2._cap.format_replay_txt(
+                r["stamp"], self.joint_names,
+                q_meas, t_meas.tolist(),
+                _m2._cap.rotvec_from_R(R_meas).tolist(), _m2._cap.quat_wxyz_from_R(R_meas),
+                q_tgt, r["t_tgt"].tolist(),
+                _m2._cap.rotvec_from_R(r["R_tgt"]).tolist(), _m2._cap.quat_wxyz_from_R(r["R_tgt"]),
+                j_err, pos_err, rot_err, arm=self.arm,
+            )
+            with open(os.path.join(run_dir, r["stamp"] + ".txt"), "w") as f:
+                f.write(txt)
+
+            # 额外存当前实测的全身关节状态(全 29 关节 + IMU)
+            self._save_all_joint_json(run_dir, r["stamp"])
 
             results.append(dict(
                 stamp=r["stamp"],
@@ -226,7 +283,7 @@ class ReplayMultiRun(ReplayCompare):
         return joint, eef
 
     @staticmethod
-    def _plot(joint, eef, n_runs, n_poses, out_png):
+    def _plot(joint, eef, n_runs, n_poses, out_png, joint_names):
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -234,7 +291,7 @@ class ReplayMultiRun(ReplayCompare):
         except Exception as e:
             print(f"[plot] matplotlib 不可用, 跳过绘图: {e}")
             return
-        short = [n.replace("left_", "").replace("_joint", "") for n in JOINT_NAMES]
+        short = [_m2._cap._short_joint(n) for n in joint_names]
         x = np.arange(len(short))
         w = 0.27
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 9))
@@ -427,14 +484,15 @@ class ReplayMultiRun(ReplayCompare):
     # ---- 主流程 --------------------------------------------------------------
     def run(self):
         self.init_dds()
-        self.init_targets()
-        self.init_kinematics()
 
+        # 先加载记录(顺便确定被回放臂 self.arm / self.joint_names), 再按臂初始化控制/建模
         records = self._load_records_full()
         if not records:
-            print(f"ERROR: 在 {self.args.data} 没找到可回放的记录 json。")
+            print(f"ERROR: 在 {self.args.data}/txt 没找到可回放的记录 txt。")
             return
-        print(f"找到 {len(records)} 个姿态, 将回放 {self.args.runs} 次。")
+        self.init_targets()
+        self.init_kinematics()
+        print(f"找到 {len(records)} 个姿态, 将回放 {self.args.runs} 次。(臂: {self.arm})")
 
         replay_root = os.path.join(self.args.data, "replay")
         os.makedirs(replay_root, exist_ok=True)
@@ -448,9 +506,13 @@ class ReplayMultiRun(ReplayCompare):
             self.rs = None
             print("WARNING: 未收到相机流, 将只统计关节/eef 误差, 不存回放图。")
 
+        # 相机探活后: 把腰部 rpy 设为 0,0,0 (接管后随 weight 渐入回正)
+        self._zero_waist()
+
+        arm_cn = "左臂" if self.arm == "left" else "右臂"
         try:
             input(f"\n将以 {self.args.speed} rad/s 慢速回放 {len(records)} 个姿态 x "
-                  f"{self.args.runs} 次。请清空左臂工作区、备好急停(Ctrl-C), 按 Enter 开始...")
+                  f"{self.args.runs} 次。请清空{arm_cn}工作区、备好急停(Ctrl-C), 按 Enter 开始...")
         except KeyboardInterrupt:
             if self.rs:
                 self.rs.stop()
@@ -494,9 +556,10 @@ class ReplayMultiRun(ReplayCompare):
 
         summary = dict(
             data_dir=os.path.abspath(self.args.data),
+            arm=self.arm,
             n_runs=len(all_runs), n_poses=n,
             ee_frame=self.args.ee_frame,
-            joint_names=JOINT_NAMES,
+            joint_names=self.joint_names,
             joint_error_deg=joint,
             eef_error=eef,
         )
@@ -511,11 +574,11 @@ class ReplayMultiRun(ReplayCompare):
         print(f"[eef ] pos mean={eef['pos_mean_mm']:.2f}mm  max={eef['pos_max_mm']:.2f}mm")
         print(f"[eef ] rot mean={eef['rot_mean_deg']:.3f}deg  max={eef['rot_max_deg']:.3f}deg")
         print("每关节误差(度): name  mean / max / min")
-        for nm, me, mx, mn in zip(JOINT_NAMES, joint["mean"], joint["max"], joint["min"]):
+        for nm, me, mx, mn in zip(self.joint_names, joint["mean"], joint["max"], joint["min"]):
             print(f"  {nm:26s} {me:6.3f} / {mx:6.3f} / {mn:6.3f}")
 
         self._plot(joint, eef, len(all_runs), n,
-                   os.path.join(replay_root, "joint_error_stats.png"))
+                   os.path.join(replay_root, "joint_error_stats.png"), self.joint_names)
 
         # 跨次回放重复性对比（参考 2a：EEF 两两差异 + 棋盘格角点亚像素位移）
         self._stability_analysis(all_runs, run_dirs, replay_root)
@@ -529,15 +592,18 @@ if __name__ == "__main__":
         "..", "g1_description", "g1_29dof_with_hand_rev_1_0.urdf"))
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("data", help="采集数据目录(含 <时间戳>.json/.png)，如 ./calib_data_20260615_0416")
+    ap.add_argument("data", help="采集数据目录(含 <时间戳>.png + txt/<时间戳>.txt)，如 ./calib_data_20260615_0416")
     ap.add_argument("--runs", type=int, default=3, help="回放次数 (默认 3)")
     ap.add_argument("--net", default="enp12s0", help="上位机连机器人的网卡, 如 enp12s0")
+    ap.add_argument("--arm", choices=["left", "right"], default=None,
+                    help="回放哪条臂; 默认按数据 txt 里的 arm 字段自动识别")
     ap.add_argument("--speed", type=float, default=_m2.DEFAULT_SPEED,
                     help=f"左臂每关节最大角速度 rad/s (越小越慢越安全, 默认 {_m2.DEFAULT_SPEED})")
     ap.add_argument("--settle", type=float, default=_m2.DEFAULT_SETTLE,
                     help=f"到位后等实测角稳定的最长秒数 (默认 {_m2.DEFAULT_SETTLE})")
     ap.add_argument("--tol-deg", type=float, default=1.5, help="实测关节角到位阈值(度) (默认 1.5)")
-    ap.add_argument("--ee-frame", default="left_hand_palm_link", help="末端坐标系(做 FK eef 比较)")
+    ap.add_argument("--ee-frame", default=None,
+                    help="末端坐标系(做 FK eef 比较); 不填则按臂取 <arm>_hand_palm_link")
     ap.add_argument("--urdf", default=_DEFAULT_URDF, help="G1 29-DoF URDF (FK/重力补偿用)")
     ap.add_argument("--gravity-scale", type=float, default=1.0, help="重力补偿力矩缩放 (默认 1.0)")
     ap.add_argument("--host", default="192.168.123.164", help="Jetson(image_server) IP")
@@ -553,8 +619,9 @@ if __name__ == "__main__":
     ap.set_defaults(gravcomp=True)
     args = ap.parse_args()
 
-    print("WARNING: clear the workspace; keep a hand ready to support the LEFT arm.")
-    print(f"左臂将慢速回放 {os.path.abspath(args.data)} 里的姿态 {args.runs} 次。")
+    _arm_hint = args.arm or "数据自动识别"
+    print(f"WARNING: clear the workspace; keep a hand ready to support the arm ({_arm_hint}).")
+    print(f"将慢速回放 {os.path.abspath(args.data)} 里的姿态 {args.runs} 次 (臂: {_arm_hint})。")
     input("Robot must be standing (锁定站立), motion mode NOT released. Press Enter...")
     ChannelFactoryInitialize(0, args.net)
     ReplayMultiRun(args).run()
