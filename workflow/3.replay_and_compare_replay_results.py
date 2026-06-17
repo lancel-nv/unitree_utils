@@ -11,7 +11,8 @@ G1 左臂【多次回放 + 重复性/精度统计 + 误差绘图】—— 上位
 输出目录结构（在采集数据目录下新建 replay/）
 --------------------------------------------
 <data>/replay/
-    <run时间戳_1>/  <stamp>_replay.png  (+ _diff.png)
+    <run时间戳_1>/  <stamp>.png             # 回放时拍的画面
+                    diff/<stamp>_diff.png   # 原图|回放|差异 三联对比(单独子文件夹)
                     <stamp>.txt             # 每姿态: 实测 + 目标 + 误差(measured/target/error)
                     <stamp>_all_joint.json  # 每姿态: 实测全身 29 关节状态 + IMU(同 get_joint_states 格式)
                     measured.json           # 左臂实测/目标/误差 json 汇总(保留, 不变)
@@ -100,9 +101,9 @@ class ReplayMultiRun(ReplayCompare):
     """多次回放 + 统计。复用 ReplayCompare 的运动控制, 仅扩展 FK 末端 + 主流程。"""
 
     def init_kinematics(self):
-        # 末端坐标系没显式指定时, 按被回放臂取 <arm>_hand_palm_link
+        # 末端坐标系没显式指定时, 按被回放臂取 <arm>_wrist_yaw_link
         if not self.args.ee_frame:
-            self.args.ee_frame = f"{self.arm}_hand_palm_link"
+            self.args.ee_frame = f"{self.arm}_wrist_yaw_link"
         # 强制开启建模（FK 比较必需），复用父类建 model/qmap/重力补偿
         self.args.gravcomp = True
         super().init_kinematics()
@@ -137,6 +138,13 @@ class ReplayMultiRun(ReplayCompare):
         }
         with open(os.path.join(run_dir, stamp + "_all_joint.json"), "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _diff_dir(run_dir):
+        """对比图(_diff.png)的子目录: <run_dir>/diff/。回放图本身存在 run_dir 下 <stamp>.png。"""
+        d = os.path.join(run_dir, "diff")
+        os.makedirs(d, exist_ok=True)
+        return d
 
     def _capture_fresh(self, flush_s=0.6):
         """拿一张【新鲜】帧。
@@ -198,6 +206,9 @@ class ReplayMultiRun(ReplayCompare):
         for i, r in enumerate(records):
             q_tgt = r["q_tgt"]
             self._set_target(self.joint_names, q_tgt)
+            # 每个姿态拍照/记录前都把腰部 3 关节(rpy)的保持目标重设为 0,0,0,
+            # 与手臂运动同时回零, 等手臂稳定时腰部也已到位再拍照采数据。
+            self._zero_waist()
             dist = self._max_move_dist(self.joint_names, q_tgt)
             est = dist / max(self.args.speed, 1e-6)
             self.wait_until_reached(est)
@@ -218,14 +229,16 @@ class ReplayMultiRun(ReplayCompare):
                   f"pos={pos_err*1000:.1f}mm  rot={rot_err:.2f}deg")
 
             # 拍照存图（相机可用时）。用 _capture_fresh 冲掉积压旧帧, 确保是到位后的画面
+            # 回放图存成 run_dir/<stamp>.png; 对比图存到子文件夹 diff/<stamp>_diff.png
             if self.rs is not None:
                 frame = self._capture_fresh()
                 if frame is not None:
-                    cv2.imwrite(os.path.join(run_dir, r["stamp"] + "_replay.png"), frame)
+                    cv2.imwrite(os.path.join(run_dir, r["stamp"] + ".png"), frame)
                     orig_path = os.path.join(self.args.data, r["img"])
                     if os.path.isfile(orig_path):
                         comp, _ = self.make_diff(cv2.imread(orig_path), frame)
-                        cv2.imwrite(os.path.join(run_dir, r["stamp"] + "_diff.png"), comp)
+                        cv2.imwrite(os.path.join(self._diff_dir(run_dir),
+                                                 r["stamp"] + "_diff.png"), comp)
 
             # 额外存每姿态 txt(实测 + 目标 + 误差); measured.json 仍照常保存(不变)
             txt = _m2._cap.format_replay_txt(
@@ -258,27 +271,50 @@ class ReplayMultiRun(ReplayCompare):
     # ---- 统计 + 绘图 ---------------------------------------------------------
     @staticmethod
     def _aggregate(all_runs):
-        """all_runs: list[run] of list[pose] dict. 汇总 joint/eef 统计。"""
-        # joint 误差(度): 堆叠成 (runs*poses, n_joints)
-        jerr = np.array([[p["joint_err_rad"] for p in run] for run in all_runs])  # (R,P,J)
-        jerr_deg = np.degrees(jerr)
-        flat = jerr_deg.reshape(-1, jerr_deg.shape[-1])      # (R*P, J)
+        """all_runs: list[run] of list[pose] dict.
+        汇总【多次回放之间】的重复性(两两差异), 而不是回放与采集记录的误差:
+        - joint: 每姿态各次回放【实测角】两两差异(deg), 逐关节统计
+        - eef  : 每姿态各次回放【实测末端位姿】两两差异(复用 2a 的 eef_pairwise)
+        """
+        n_runs = len(all_runs)
+        n_poses = len(all_runs[0])
+
+        # joint: 实测角 (R,P,J), 取各次回放两两差异(度)
+        qm = np.array([[p["q_meas"] for p in run] for run in all_runs])  # (R,P,J) rad
+        pair_idx = [(i, k) for i in range(n_runs) for k in range(i + 1, n_runs)]
+        if pair_idx:
+            jpair = np.array([np.abs(qm[i] - qm[k]) for i, k in pair_idx])  # (npair,P,J)
+        else:
+            jpair = np.zeros((1,) + qm.shape[1:])   # 只有 1 次回放: 无重复性, 记 0
+        jpair_deg = np.degrees(jpair)
+        flat = jpair_deg.reshape(-1, jpair_deg.shape[-1])      # (npair*P, J)
         joint = dict(
             mean=flat.mean(axis=0).tolist(),
             max=flat.max(axis=0).tolist(),
             min=flat.min(axis=0).tolist(),
             overall_mean=float(flat.mean()),
             overall_max=float(flat.max()),
-            per_run_mean=[float(np.degrees(np.array([p["joint_err_rad"] for p in run])).mean())
-                          for run in all_runs],
+            per_pose_mean=[float(jpair_deg[:, p, :].mean()) for p in range(n_poses)],
         )
-        pos = np.array([[p["eef_pos_err_m"] for p in run] for run in all_runs]) * 1000.0  # mm
-        rot = np.array([[p["eef_rot_err_deg"] for p in run] for run in all_runs])         # deg
+
+        # eef: 每姿态各次回放两两差异(位置 mm / 姿态 deg), 复用 2a 的 eef_pairwise
+        pos_list, rot_list = [], []
+        if n_runs >= 2:
+            for p in range(n_poses):
+                poses = [EefPose(np.array(all_runs[r][p]["t_meas"], float),
+                                 np.array(all_runs[r][p]["r_meas_rotvec"], float),
+                                 np.array(all_runs[r][p]["q_meas"], float))
+                         for r in range(n_runs)]
+                em = eef_pairwise(poses)
+                pos_list.append(em["eef_t_mean_mm"])
+                rot_list.append(em["eef_r_mean_deg"])
+        pos = np.array(pos_list) if pos_list else np.zeros(1)
+        rot = np.array(rot_list) if rot_list else np.zeros(1)
         eef = dict(
             pos_mean_mm=float(pos.mean()), pos_max_mm=float(pos.max()), pos_min_mm=float(pos.min()),
             rot_mean_deg=float(rot.mean()), rot_max_deg=float(rot.max()), rot_min_deg=float(rot.min()),
-            per_run_pos_mean_mm=[float(p.mean()) for p in pos],
-            per_run_rot_mean_deg=[float(rr.mean()) for rr in rot],
+            per_pose_pos_mean_mm=pos.tolist(),
+            per_pose_rot_mean_deg=rot.tolist(),
         )
         return joint, eef
 
@@ -303,8 +339,9 @@ class ReplayMultiRun(ReplayCompare):
             ax1.text(xi, mv, f"{mv:.2f}", ha="center", va="bottom", fontsize=8)
         ax1.set_xticks(x)
         ax1.set_xticklabels(short, rotation=30, ha="right")
-        ax1.set_ylabel("joint error (deg)")
-        ax1.set_title(f"Per-joint replay error  ({n_runs} runs x {n_poses} poses)  "
+        ax1.set_ylabel("joint repeatability (deg)")
+        ax1.set_title(f"Per-joint replay repeatability (pairwise across runs)  "
+                      f"({n_runs} runs x {n_poses} poses)  "
                       f"overall mean={joint['overall_mean']:.2f}deg  max={joint['overall_max']:.2f}deg")
         ax1.legend()
         ax1.grid(axis="y", ls=":", alpha=0.6)
@@ -321,8 +358,8 @@ class ReplayMultiRun(ReplayCompare):
             ax2.text(xi, mv, f"{mv:.2f}", ha="center", va="bottom", fontsize=9)
         ax2.set_xticks(xe)
         ax2.set_xticklabels(labels)
-        ax2.set_ylabel("EEF error")
-        ax2.set_title("End-effector replay error (vs recorded FK)")
+        ax2.set_ylabel("EEF repeatability")
+        ax2.set_title("End-effector replay repeatability (pairwise across runs)")
         ax2.legend()
         ax2.grid(axis="y", ls=":", alpha=0.6)
 
@@ -343,7 +380,7 @@ class ReplayMultiRun(ReplayCompare):
             print("\n[stability] 只有 1 次回放, 跳过跨次对比(至少需要 2 次)。")
             return
         if self.rs is None and not any(
-                os.path.isfile(os.path.join(d, all_runs[0][0]["stamp"] + "_replay.png"))
+                os.path.isfile(os.path.join(d, all_runs[0][0]["stamp"] + ".png"))
                 for d in run_dirs):
             print("\n[stability] 没有回放图(无相机), 仅做 EEF 重复性对比, 跳过角点。")
 
@@ -389,7 +426,7 @@ class ReplayMultiRun(ReplayCompare):
 
                 corner_sets, base_img = [], None
                 for d in run_dirs:
-                    ip = Path(os.path.join(d, stamp + "_replay.png"))
+                    ip = Path(os.path.join(d, stamp + ".png"))
                     cs, img = detect_corners(ip, pattern)
                     if cs is not None and cs.shape[0] == expected:
                         corner_sets.append(cs)
@@ -560,20 +597,20 @@ class ReplayMultiRun(ReplayCompare):
             n_runs=len(all_runs), n_poses=n,
             ee_frame=self.args.ee_frame,
             joint_names=self.joint_names,
-            joint_error_deg=joint,
-            eef_error=eef,
+            joint_repeatability_deg=joint,
+            eef_repeatability=eef,
         )
         with open(os.path.join(replay_root, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
 
-        print("\n================ 统计结果 ================")
+        print("\n========== 统计结果(多次回放之间的重复性) ==========")
         print(f"回放次数={len(all_runs)}  姿态数={n}")
         print(f"[joint] 整体 mean={joint['overall_mean']:.3f}deg  max={joint['overall_max']:.3f}deg")
-        print(f"[joint] 每次回放 mean(deg): "
-              + ", ".join(f"{v:.3f}" for v in joint["per_run_mean"]))
+        print(f"[joint] 每姿态 mean(deg): "
+              + ", ".join(f"{v:.3f}" for v in joint["per_pose_mean"]))
         print(f"[eef ] pos mean={eef['pos_mean_mm']:.2f}mm  max={eef['pos_max_mm']:.2f}mm")
         print(f"[eef ] rot mean={eef['rot_mean_deg']:.3f}deg  max={eef['rot_max_deg']:.3f}deg")
-        print("每关节误差(度): name  mean / max / min")
+        print("每关节重复性(度, 回放间两两差异): name  mean / max / min")
         for nm, me, mx, mn in zip(self.joint_names, joint["mean"], joint["max"], joint["min"]):
             print(f"  {nm:26s} {me:6.3f} / {mx:6.3f} / {mn:6.3f}")
 
@@ -603,7 +640,7 @@ if __name__ == "__main__":
                     help=f"到位后等实测角稳定的最长秒数 (默认 {_m2.DEFAULT_SETTLE})")
     ap.add_argument("--tol-deg", type=float, default=1.5, help="实测关节角到位阈值(度) (默认 1.5)")
     ap.add_argument("--ee-frame", default=None,
-                    help="末端坐标系(做 FK eef 比较); 不填则按臂取 <arm>_hand_palm_link")
+                    help="末端坐标系(做 FK eef 比较); 不填则按臂取 <arm>_wrist_yaw_link")
     ap.add_argument("--urdf", default=_DEFAULT_URDF, help="G1 29-DoF URDF (FK/重力补偿用)")
     ap.add_argument("--gravity-scale", type=float, default=1.0, help="重力补偿力矩缩放 (默认 1.0)")
     ap.add_argument("--host", default="192.168.123.164", help="Jetson(image_server) IP")
